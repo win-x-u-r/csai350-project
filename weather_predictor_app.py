@@ -7,6 +7,8 @@ from pgmpy.models import DiscreteBayesianNetwork
 from pgmpy.estimators import MaximumLikelihoodEstimator
 from pgmpy.inference import VariableElimination
 from collections import defaultdict
+from tkinter import messagebox
+from datetime import datetime, timedelta
 
 # === Load and preprocess ===
 data = pd.read_csv("cleaned_weather.csv")
@@ -49,8 +51,8 @@ bn_model, bn_infer = train_bayesian_network(data)
 # === Markov Model Setup ===
 states = sorted(data['weather_label'].unique())
 icons = {
-    "Sunny": "☀️", "Rainy": "🌧️", "Thunderstorm": "⚡", "Cloudy": "☁️", "Fog": "🌫",
-    "Snow": "❄️", "Mist": "🌫", "Clear": "☀️", "Strong Wind": "💨", "Partly Cloudy": "⛅", "Storm": "⚡"
+    "Sunny": "☀", "Rainy": "🌧", "Thunderstorm": "⚡", "Cloudy": "☁", "Fog": "🌫",
+    "Snow": "❄", "Mist": "🌫", "Clear": "☀", "Strong Wind": "💨", "Partly Cloudy": "⛅", "Storm": "⚡"
 }
 state_to_index = {state: i for i, state in enumerate(states)}
 index_to_state = {i: state for state, i in state_to_index.items()}
@@ -77,14 +79,91 @@ def predict_weather_markov(current_state, days, matrix):
         index = next_index
     return predictions
 
-def estimate_continuous_values(state):
-    subset = data[data['weather_label'] == state]
-    if len(subset) == 0:
-        return {"temperature": np.nan, "humidity": np.nan, "wind": np.nan}
+# === Modified Continuous Prediction ===
+def estimate_continuous_values_from_categories(temp_cat, humidity_cat, wind_cat, state):
+    # First try exact match
+    exact_subset = data[
+        (data['temp_cat'] == temp_cat) &
+        (data['humidity_cat'] == humidity_cat) &
+        (data['wind_cat'] == wind_cat) &
+        (data['weather_label'] == state)
+    ]
+    
+    if len(exact_subset) > 0:
+        return {
+            "temperature": exact_subset['temperature'].mean().round(1),
+            "humidity": exact_subset['humidity'].mean().round(1),
+            "wind": exact_subset['wind'].mean().round(1)
+        }
+    
+    # If no exact match, try partial matches with weighted averages
+    partial_subsets = []
+    weights = []
+    
+    # Try matching 2 out of 3 categories + weather state
+    for cols in [['temp_cat', 'humidity_cat'], 
+                 ['temp_cat', 'wind_cat'], 
+                 ['humidity_cat', 'wind_cat']]:
+        query = (data['weather_label'] == state)
+        for col in cols:
+            if col == 'temp_cat':
+                query &= (data['temp_cat'] == temp_cat)
+            elif col == 'humidity_cat':
+                query &= (data['humidity_cat'] == humidity_cat)
+            elif col == 'wind_cat':
+                query &= (data['wind_cat'] == wind_cat)
+        
+        subset = data[query]
+        if len(subset) > 0:
+            partial_subsets.append(subset)
+            weights.append(2)  # Higher weight for 2/3 matches
+    
+    # Try matching just 1 category + weather state
+    for col in ['temp_cat', 'humidity_cat', 'wind_cat']:
+        query = (data['weather_label'] == state)
+        if col == 'temp_cat':
+            query &= (data['temp_cat'] == temp_cat)
+        elif col == 'humidity_cat':
+            query &= (data['humidity_cat'] == humidity_cat)
+        elif col == 'wind_cat':
+            query &= (data['wind_cat'] == wind_cat)
+        
+        subset = data[query]
+        if len(subset) > 0:
+            partial_subsets.append(subset)
+            weights.append(1)  # Lower weight for 1/3 matches
+    
+    # If we found any partial matches
+    if len(partial_subsets) > 0:
+        # Calculate weighted averages
+        total_weight = sum(weights)
+        temp_sum = hum_sum = wind_sum = 0
+        
+        for subset, weight in zip(partial_subsets, weights):
+            temp_sum += subset['temperature'].mean() * weight
+            hum_sum += subset['humidity'].mean() * weight
+            wind_sum += subset['wind'].mean() * weight
+        
+        return {
+            "temperature": round(temp_sum / total_weight, 1),
+            "humidity": round(hum_sum / total_weight, 1),
+            "wind": round(wind_sum / total_weight, 1)
+        }
+    
+    # Final fallback - just use averages for the weather state
+    state_subset = data[data['weather_label'] == state]
+    if len(state_subset) > 0:
+        return {
+            "temperature": state_subset['temperature'].mean().round(1),
+            "humidity": state_subset['humidity'].mean().round(1),
+            "wind": state_subset['wind'].mean().round(1)
+        }
+    
+    # Ultimate fallback - use overall averages
     return {
-        "temperature": subset['temperature'].mean().round(1),
-        "humidity": subset['humidity'].mean().round(1),
-        "wind": subset['wind'].mean().round(1)
+        "temperature": data['temperature'].mean().round(1),
+        "humidity": data['humidity'].mean().round(1),
+        "wind": data['wind'].mean().round(1)
     }
 
 def predict_weather_bayes(temp, humidity, wind):
@@ -114,14 +193,6 @@ def show_transition_graph(current_state):
     plt.title(f"Transition Probabilities from '{current_state}'")
     plt.show()
 
-    plt.figure(figsize=(8, 4))
-    plt.bar([index_to_state[i] for i in range(len(states))], probs, color='skyblue')
-    plt.ylabel("Probability")
-    plt.title(f"Next-State Distribution from '{current_state}'")
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-
 # === GUI ===
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -130,29 +201,50 @@ class WeatherApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("AI Weather Predictor")
-        self.geometry("950x600")
+        self.geometry("1000x750")
         self.current_unit = "C"
-        self.forecast_celsius = [None] * 7
+        self.current_prediction = None
+        self.forecast_data = [None] * 7
         self.build_ui()
+        self.set_default_values()
+        self.update_forecast_dates()
 
     def build_ui(self):
         self.grid_columnconfigure(0, weight=1)
 
-        self.location_label = ctk.CTkLabel(self, text="3mman", font=("Segoe UI", 24, "bold"))
-        self.location_label.pack(pady=(20, 5))
+        # Header
+        self.header_frame = ctk.CTkFrame(self)
+        self.header_frame.pack(pady=(20, 10), padx=20, fill="x")
+        
+        self.location_label = ctk.CTkLabel(self.header_frame, text="3mman Weather", font=("Segoe UI", 24, "bold"))
+        self.location_label.pack(side="left", padx=10)
+        
+        self.theme_switch = ctk.CTkSwitch(self.header_frame, text="Light Mode", command=self.toggle_theme)
+        self.theme_switch.pack(side="right", padx=10)
 
+        # Current weather display
         self.current_weather_frame = ctk.CTkFrame(self)
-        self.current_weather_frame.pack(pady=10)
+        self.current_weather_frame.pack(pady=10, padx=20, fill="x")
 
-        self.current_weather_icon = ctk.CTkLabel(self.current_weather_frame, text="☀️", font=("Segoe UI", 40))
-        self.current_weather_icon.grid(row=0, column=0, padx=10)
+        self.current_weather_icon = ctk.CTkLabel(self.current_weather_frame, text="☀", font=("Segoe UI", 40))
+        self.current_weather_icon.grid(row=0, column=0, padx=10, rowspan=2)
 
-        self.current_weather_text = ctk.CTkLabel(self.current_weather_frame, text="Partly cloudy", font=("Segoe UI", 16))
-        self.current_weather_text.grid(row=0, column=1, padx=10)
+        self.current_weather_text = ctk.CTkLabel(self.current_weather_frame, text="Enter values and click Predict", 
+                                               font=("Segoe UI", 16))
+        self.current_weather_text.grid(row=0, column=1, padx=10, sticky="w")
 
-        self.current_temp_label = ctk.CTkLabel(self.current_weather_frame, text="15°C", font=("Segoe UI", 16))
-        self.current_temp_label.grid(row=0, column=2, padx=10)
+        self.current_temp_label = ctk.CTkLabel(self.current_weather_frame, text="--", font=("Segoe UI", 16))
+        self.current_temp_label.grid(row=0, column=2, padx=10, sticky="w")
 
+        self.current_humidity_label = ctk.CTkLabel(self.current_weather_frame, text="Humidity: --%", 
+                                                  font=("Segoe UI", 12))
+        self.current_humidity_label.grid(row=1, column=1, padx=10, sticky="w")
+
+        self.current_wind_label = ctk.CTkLabel(self.current_weather_frame, text="Wind: -- m/h", 
+                                             font=("Segoe UI", 12))
+        self.current_wind_label.grid(row=1, column=2, padx=10, sticky="w")
+
+        # Input section
         input_frame = ctk.CTkFrame(self)
         input_frame.pack(pady=20, padx=20, fill="x")
 
@@ -164,7 +256,7 @@ class WeatherApp(ctk.CTk):
         self.humidity_input = ctk.CTkEntry(input_frame, placeholder_text="e.g. 65")
         self.humidity_input.grid(row=1, column=1, padx=5)
 
-        ctk.CTkLabel(input_frame, text="Wind Speed (km/h):").grid(row=0, column=2, padx=5, sticky="w")
+        ctk.CTkLabel(input_frame, text="Wind Speed (m/h):").grid(row=0, column=2, padx=5, sticky="w")
         self.wind_input = ctk.CTkEntry(input_frame, placeholder_text="e.g. 12")
         self.wind_input.grid(row=1, column=2, padx=5)
 
@@ -173,9 +265,30 @@ class WeatherApp(ctk.CTk):
         self.days_input.set(3)
         self.days_input.grid(row=1, column=3, padx=10, sticky="ew")
 
-        self.predict_btn = ctk.CTkButton(self, text="Predict Weather", command=self.run_prediction)
-        self.predict_btn.pack(pady=10)
+        # Input value display
+        self.input_display_frame = ctk.CTkFrame(self)
+        self.input_display_frame.pack(pady=10, padx=20, fill="x")
 
+        self.input_temp_label = ctk.CTkLabel(self.input_display_frame, text="Temperature Entered: --°C")
+        self.input_temp_label.pack(side="left", padx=10)
+
+        self.input_humidity_label = ctk.CTkLabel(self.input_display_frame, text="Humidity Entered: --%")
+        self.input_humidity_label.pack(side="left", padx=10)
+
+        self.input_wind_label = ctk.CTkLabel(self.input_display_frame, text="Wind Speed Entered: -- m/h")
+        self.input_wind_label.pack(side="left", padx=10)
+
+        # Button section
+        button_frame = ctk.CTkFrame(self)
+        button_frame.pack(pady=10)
+
+        self.predict_btn = ctk.CTkButton(button_frame, text="Predict Weather", command=self.start_prediction)
+        self.predict_btn.pack(side="left", padx=5)
+
+        self.graph_btn = ctk.CTkButton(button_frame, text="Show Graph", command=self.show_graph, state="disabled")
+        self.graph_btn.pack(side="left", padx=5)
+
+        # Unit selection
         self.unit_frame = ctk.CTkFrame(self)
         self.unit_frame.pack(pady=5)
         self.unit_var = ctk.StringVar(value="C")
@@ -184,21 +297,67 @@ class WeatherApp(ctk.CTk):
         ctk.CTkRadioButton(self.unit_frame, text="°F", variable=self.unit_var, value="F", command=self.update_units).pack(side="left", padx=5)
         ctk.CTkRadioButton(self.unit_frame, text="K", variable=self.unit_var, value="K", command=self.update_units).pack(side="left", padx=5)
 
+        # Forecast display
         self.forecast_frame = ctk.CTkFrame(self)
         self.forecast_frame.pack(pady=10, padx=20, fill="both", expand=True)
 
-        self.day_labels, self.temp_labels, self.weather_icons = [], [], []
+        # Create forecast day columns
+        self.day_frames = []
+        self.day_labels = []
+        self.date_labels = []
+        self.weather_icons = []
+        self.temp_labels = []
+        self.humidity_labels = []
+        self.wind_labels = []
+
         for i in range(7):
-            self.forecast_frame.grid_columnconfigure(i, weight=1)
-            day = ctk.CTkLabel(self.forecast_frame, text="", font=("Segoe UI", 12))
-            temp = ctk.CTkLabel(self.forecast_frame, text="--", font=("Segoe UI", 14, "bold"))
-            icon = ctk.CTkLabel(self.forecast_frame, text="", font=("Segoe UI", 24))
-            day.grid(row=0, column=i, padx=10, pady=5)
-            temp.grid(row=1, column=i, padx=10)
-            icon.grid(row=2, column=i, padx=10)
-            self.day_labels.append(day)
-            self.temp_labels.append(temp)
+            frame = ctk.CTkFrame(self.forecast_frame)
+            frame.grid(row=0, column=i, padx=5, pady=5, sticky="nsew")
+            self.forecast_frame.columnconfigure(i, weight=1)
+            self.day_frames.append(frame)
+
+            day_label = ctk.CTkLabel(frame, text=f"Day {i+1}", font=("Segoe UI", 12, "bold"))
+            day_label.pack(pady=(5, 0))
+            self.day_labels.append(day_label)
+
+            date_label = ctk.CTkLabel(frame, text="", font=("Segoe UI", 10))
+            date_label.pack()
+            self.date_labels.append(date_label)
+
+            icon = ctk.CTkLabel(frame, text="", font=("Segoe UI", 24))
+            icon.pack(pady=5)
             self.weather_icons.append(icon)
+
+            temp_label = ctk.CTkLabel(frame, text="--", font=("Segoe UI", 14))
+            temp_label.pack()
+            self.temp_labels.append(temp_label)
+
+            humidity_label = ctk.CTkLabel(frame, text="Humidity: --%", font=("Segoe UI", 10))
+            humidity_label.pack()
+            self.humidity_labels.append(humidity_label)
+
+            wind_label = ctk.CTkLabel(frame, text="Wind: -- m/h", font=("Segoe UI", 10))
+            wind_label.pack()
+            self.wind_labels.append(wind_label)
+
+    def set_default_values(self):
+        self.temp_input.insert(0, "15")
+        self.humidity_input.insert(0, "65")
+        self.wind_input.insert(0, "12")
+
+    def update_forecast_dates(self):
+        today = datetime.now()
+        for i in range(7):
+            forecast_date = today + timedelta(days=i+1)
+            self.date_labels[i].configure(text=forecast_date.strftime("%b %d"))
+
+    def toggle_theme(self):
+        if self.theme_switch.get() == 1:
+            ctk.set_appearance_mode("light")
+            self.theme_switch.configure(text="Dark Mode")
+        else:
+            ctk.set_appearance_mode("dark")
+            self.theme_switch.configure(text="Light Mode")
 
     def convert_temp(self, temp_c, unit):
         if unit == "F":
@@ -213,55 +372,102 @@ class WeatherApp(ctk.CTk):
         self.update_forecast_display()
 
     def update_current_weather_display(self):
-        try:
-            temp_c = float(self.temp_input.get())
-            temp, unit = self.convert_temp(temp_c, self.current_unit)
+        if self.current_prediction:
+            temp, unit = self.convert_temp(self.current_prediction["temperature"], self.current_unit)
             self.current_temp_label.configure(text=f"{temp:.1f}{unit}")
-        except:
-            self.current_temp_label.configure(text="--")
+            self.current_humidity_label.configure(text=f"Humidity: {self.current_prediction['humidity']}%")
+            self.current_wind_label.configure(text=f"Wind: {self.current_prediction['wind']} m/h")
 
     def update_forecast_display(self):
         for i in range(7):
-            if self.forecast_celsius[i] is not None:
-                temp, unit = self.convert_temp(self.forecast_celsius[i], self.current_unit)
+            if self.forecast_data[i] is not None:
+                temp, unit = self.convert_temp(self.forecast_data[i]["temperature"], self.current_unit)
                 self.temp_labels[i].configure(text=f"{temp:.1f}{unit}")
+                self.humidity_labels[i].configure(text=f"Humidity: {self.forecast_data[i]['humidity']}%")
+                self.wind_labels[i].configure(text=f"Wind: {self.forecast_data[i]['wind']} m/h")
+
+    def validate_inputs(self):
+        try:
+            temp = float(self.temp_input.get())
+            humidity = float(self.humidity_input.get())
+            wind = float(self.wind_input.get())
+            
+            if not (0 <= humidity <= 100):
+                raise ValueError("Humidity must be between 0-100%")
+            if wind < 0:
+                raise ValueError("Wind speed cannot be negative")
+            
+            return True
+        except ValueError as e:
+            messagebox.showerror("Input Error", str(e))
+            return False
+
+    def start_prediction(self):
+        if not self.validate_inputs():
+            return
+            
+        self.predict_btn.configure(state="disabled", text="Predicting...")
+        self.graph_btn.configure(state="disabled")
+        self.after(100, self.run_prediction)
 
     def run_prediction(self):
         try:
+            # Get user inputs
             temp = float(self.temp_input.get())
             humidity = float(self.humidity_input.get())
             wind = float(self.wind_input.get())
             days = int(self.days_input.get())
 
-            predicted_label = predict_weather_bayes(temp, humidity, wind)
-            self.current_weather_text.configure(text=predicted_label)
-            self.current_weather_icon.configure(text=icons.get(predicted_label, "☀️"))
+            # Update input labels
+            self.input_temp_label.configure(text=f"Temperature Entered: {temp:.1f}°C")
+            self.input_humidity_label.configure(text=f"Humidity Entered: {humidity:.1f}%")
+            self.input_wind_label.configure(text=f"Wind Speed Entered: {wind:.1f} m/h")
+
+            # Bayesian prediction for today's weather state
+            predicted_weather = predict_weather_bayes(temp, humidity, wind)
+
+            # Store today's weather using USER INPUT VALUES
+            self.current_prediction = {
+                "temperature": temp,  # Use the input temperature directly
+                "humidity": humidity,  # Use the input humidity directly
+                "wind": wind,  # Use the input wind speed directly
+                "weather_state": predicted_weather  # Store the predicted state
+            }
+
+            # Display today's weather (using input values)
+            self.current_weather_text.configure(text=f"Today's Weather: {predicted_weather}")
+            self.current_weather_icon.configure(text=icons.get(predicted_weather, "☀"))
             self.update_current_weather_display()
 
-            show_transition_graph(predicted_label)
+            # Forecast prediction using Markov Model (using predicted values for future days)
+            markov_predictions = predict_weather_markov(predicted_weather, days, transition_matrix)
+            self.forecast_data = [None] * 7
 
-            predictions = predict_weather_markov(predicted_label, days, transition_matrix)
-            self.forecast_celsius = [None] * 7
+            for i, weather in enumerate(markov_predictions):
+                forecast = estimate_continuous_values_from_categories(
+                    categorize_temp(temp),
+                    categorize_humidity(humidity),
+                    categorize_wind(wind),
+                    weather
+                )
 
-            for i in range(7):
-                if i < days:
-                    state = predictions[i]
-                    if i == 0:
-                        temp_c = temp  # match user input for today
-                    else:
-                        values = estimate_continuous_values(state)
-                        temp_c = values["temperature"]
-                    self.forecast_celsius[i] = temp_c
-                    temp_disp, unit = self.convert_temp(temp_c, self.current_unit)
-                    self.day_labels[i].configure(text=["Today", "Tomorrow", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7"][i])
-                    self.temp_labels[i].configure(text=f"{temp_disp:.1f}{unit}")
-                    self.weather_icons[i].configure(text=icons.get(state, "☀️"))
-                else:
-                    self.day_labels[i].configure(text="")
-                    self.temp_labels[i].configure(text="--")
-                    self.weather_icons[i].configure(text="")
+                if forecast:
+                    self.forecast_data[i] = forecast
+                    self.weather_icons[i].configure(text=icons.get(weather, "☀"))
+                    self.day_labels[i].configure(text=f"Day {i+1} ({weather})")
+
+            self.update_forecast_display()
+
         except Exception as e:
-            print(f"Error: {e}")
+            messagebox.showerror("Error", f"An error occurred while predicting: {str(e)}")
+        finally:
+            self.predict_btn.configure(state="normal", text="Predict Weather")
+            self.graph_btn.configure(state="normal")
+
+    def show_graph(self):
+        if self.current_prediction:
+            current_weather = self.current_weather_text.cget("text").replace("Today's Weather: ", "")
+            show_transition_graph(current_weather)
 
 if __name__ == "__main__":
     app = WeatherApp()
