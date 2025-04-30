@@ -79,7 +79,7 @@ def predict_weather_markov(current_state, days, matrix):
         index = next_index
     return predictions
 
-# === Modified Continuous Prediction ===
+# === Continuous Prediction ===
 def estimate_continuous_values_from_categories(temp_cat, humidity_cat, wind_cat, state):
     # First try exact match
     exact_subset = data[
